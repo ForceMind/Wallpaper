@@ -5,6 +5,9 @@
 ## 功能
 
 - 壁纸源：Bing 每日壁纸、Unsplash 精选、Picsum（自动回退）。
+- 额外在线源：Wikimedia Commons 精选风景图。
+- 离线源：内置 120 套程序化壁纸，首次使用时按需生成，不占用大量安装包空间。
+- 界面语言：默认中文，可在菜单栏切换 English；设置会持久化。
 - 更新策略：仅手动、固定间隔、每日定时、启动时、网络变化（轮询兜底）、随机时间窗。
 - 缓存：写入 `~/Library/Application Support/Wallpaper/Cache`，默认最多保留 20 张并按修改时间淘汰。
 - 菜单栏操作：立即更新、暂停/恢复自动更新、切换来源与策略、选择 15/30/60/180 分钟间隔、打开缓存目录、退出。
@@ -21,7 +24,11 @@
 | 网络变化 | 每 5 分钟检查一次并更新 | 网络恢复后的兜底同步 |
 | 随机时间窗 | 默认 08:00–22:00，每天随机触发一次 | 不规律更换 |
 
-网络请求失败会自动按“首选来源 → Bing → Unsplash → Picsum”顺序回退。图片下载采用文件流接口，避免把整张 4K 图片保存在 Swift `Data` 中；缓存达到上限后按文件修改时间淘汰最旧文件。
+网络请求失败会自动按“首选来源 → Bing → Unsplash → Wikimedia → Picsum → 内置壁纸”顺序回退。完全离线时仍可从内置 120 套壁纸继续更新。图片下载采用文件流接口，避免把整张 4K 图片保存在 Swift `Data` 中；缓存达到上限后按文件修改时间淘汰最旧文件。
+
+## 图标
+
+应用图标位于 `Assets/AppIcon.png`，由日出、山脉和湖泊构成的圆角玻璃图标。打包脚本会自动把它复制到 App Bundle 的 Resources 并写入 `Info.plist`。
 
 ## 构建与运行
 
@@ -63,4 +70,4 @@ gh release create v1.0.0 dist/Wallpaper-v1.0.0.zip --title "Wallpaper v1.0.0" --
 
 ## 后续扩展
 
-可在 `WallpaperProvider` 协议上增加本地文件夹、RSS/JSON API、NASA APOD 等来源；调度器可替换为 `NSWorkspace` 登录/解锁通知和 `NWPathMonitor` 以获得更即时的系统事件。
+可在 `WallpaperProvider` 协议上增加本地文件夹、RSS/JSON API、NASA APOD 等来源；内置壁纸目录可扩展到更多程序化主题；调度器可替换为 `NSWorkspace` 登录/解锁通知和 `NWPathMonitor` 以获得更即时的系统事件。

@@ -1,34 +1,47 @@
 import AppKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Domain
 
 enum WallpaperSource: String, CaseIterable, Codable {
-    case bing, unsplash, picsum
+    case bing, unsplash, wikimedia, picsum, builtin
 
-    var title: String {
-        switch self { case .bing: return "Bing 每日"; case .unsplash: return "Unsplash Source"; case .picsum: return "Picsum 兜底" }
+    func title(for language: AppLanguage) -> String {
+        switch self {
+        case .bing: return language == .english ? "Bing Daily" : "Bing 每日"
+        case .unsplash: return language == .english ? "Unsplash Picks" : "Unsplash 精选"
+        case .wikimedia: return language == .english ? "Wikimedia Commons" : "维基共享资源"
+        case .picsum: return language == .english ? "Picsum Random" : "Picsum 随机"
+        case .builtin: return language == .english ? "Built-in 120 Wallpapers" : "内置 120 张"
+        }
     }
 }
 
 enum UpdateStrategy: String, CaseIterable, Codable {
     case manual, interval, daily, onLaunch, networkChange, randomWindow
 
-    var title: String {
+    func title(for language: AppLanguage) -> String {
         switch self {
-        case .manual: return "仅手动"
-        case .interval: return "固定间隔"
-        case .daily: return "每日定时"
-        case .onLaunch: return "启动时"
-        case .networkChange: return "网络变化"
-        case .randomWindow: return "随机时间窗"
+        case .manual: return language == .english ? "Manual only" : "仅手动"
+        case .interval: return language == .english ? "Fixed interval" : "固定间隔"
+        case .daily: return language == .english ? "Daily schedule" : "每日定时"
+        case .onLaunch: return language == .english ? "On launch" : "启动时"
+        case .networkChange: return language == .english ? "Network polling" : "网络变化"
+        case .randomWindow: return language == .english ? "Random window" : "随机时间窗"
         }
     }
+}
+
+enum AppLanguage: String, Codable, CaseIterable {
+    case chinese, english
 }
 
 struct AppSettings: Codable {
     var source: WallpaperSource = .bing
     var strategy: UpdateStrategy = .daily
+    var language: AppLanguage = .chinese
     var intervalMinutes: Int = 60
     var dailyHour: Int = 9
     var dailyMinute: Int = 0
@@ -36,6 +49,22 @@ struct AppSettings: Codable {
     var randomEndHour: Int = 22
     var pauseUpdates = false
     var keepFiles = 20
+
+    private enum CodingKeys: String, CodingKey { case source, strategy, language, intervalMinutes, dailyHour, dailyMinute, randomStartHour, randomEndHour, pauseUpdates, keepFiles }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        source = try c.decodeIfPresent(WallpaperSource.self, forKey: .source) ?? .bing
+        strategy = try c.decodeIfPresent(UpdateStrategy.self, forKey: .strategy) ?? .daily
+        language = try c.decodeIfPresent(AppLanguage.self, forKey: .language) ?? .chinese
+        intervalMinutes = try c.decodeIfPresent(Int.self, forKey: .intervalMinutes) ?? 60
+        dailyHour = try c.decodeIfPresent(Int.self, forKey: .dailyHour) ?? 9
+        dailyMinute = try c.decodeIfPresent(Int.self, forKey: .dailyMinute) ?? 0
+        randomStartHour = try c.decodeIfPresent(Int.self, forKey: .randomStartHour) ?? 8
+        randomEndHour = try c.decodeIfPresent(Int.self, forKey: .randomEndHour) ?? 22
+        pauseUpdates = try c.decodeIfPresent(Bool.self, forKey: .pauseUpdates) ?? false
+        keepFiles = try c.decodeIfPresent(Int.self, forKey: .keepFiles) ?? 20
+    }
 }
 
 struct WallpaperImage: Codable {
@@ -98,6 +127,79 @@ struct PicsumProvider: WallpaperProvider {
     }
 }
 
+struct WikimediaProvider: WallpaperProvider {
+    let source: WallpaperSource = .wikimedia
+    func fetch() async throws -> WallpaperImage {
+        var components = URLComponents(string: "https://commons.wikimedia.org/w/api.php")!
+        components.queryItems = [
+            URLQueryItem(name: "action", value: "query"),
+            URLQueryItem(name: "generator", value: "search"),
+            URLQueryItem(name: "gsrsearch", value: "featured landscape"),
+            URLQueryItem(name: "gsrnamespace", value: "6"),
+            URLQueryItem(name: "gsrlimit", value: "1"),
+            URLQueryItem(name: "prop", value: "imageinfo"),
+            URLQueryItem(name: "iiprop", value: "url"),
+            URLQueryItem(name: "iiurlwidth", value: "3840"),
+            URLQueryItem(name: "format", value: "json")
+        ]
+        let (data, response) = try await URLSession.shared.data(from: components.url!)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ProviderError.badResponse }
+        struct Feed: Decodable {
+            struct Query: Decodable {
+                struct Page: Decodable { struct Info: Decodable { let thumburl: String?; let url: String }; let title: String; let imageinfo: [Info] }
+                let pages: [String: Page]
+            }
+            let query: Query?
+        }
+        let feed = try JSONDecoder().decode(Feed.self, from: data)
+        guard let page = feed.query?.pages.values.first, let info = page.imageinfo.first,
+              let imageURL = URL(string: info.thumburl ?? info.url) else { throw ProviderError.emptyFeed }
+        return WallpaperImage(id: "wikimedia-\(page.title)", url: imageURL, title: "维基：\(page.title)", source: source)
+    }
+}
+
+struct BuiltInProvider: WallpaperProvider {
+    let source: WallpaperSource = .builtin
+    let language: AppLanguage
+    private let count = 120
+
+    func fetch() async throws -> WallpaperImage {
+        let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
+        let index = (day - 1) % count
+        let file = try renderIfNeeded(index: index)
+        let title = language == .english ? "Built-in wallpaper #\(index + 1)" : "内置壁纸 #\(index + 1)"
+        return WallpaperImage(id: "builtin-\(index + 1)", url: file, title: title, source: source)
+    }
+
+    private func renderIfNeeded(index: Int) throws -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let directory = base.appendingPathComponent("Wallpaper/BuiltIn", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory.appendingPathComponent(String(format: "wallpaper-%03d.png", index + 1))
+        if FileManager.default.fileExists(atPath: destination.path) { return destination }
+
+        let width = 1600, height = 1000
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw ProviderError.noData }
+        let hue = Double(index % 24) / 24.0
+        let top = NSColor(hue: CGFloat(hue), saturation: 0.60, brightness: 0.22, alpha: 1).cgColor
+        let bottom = NSColor(hue: CGFloat((hue + 0.08).truncatingRemainder(dividingBy: 1)), saturation: 0.72, brightness: 0.78, alpha: 1).cgColor
+        let gradient = CGGradient(colorsSpace: colorSpace, colors: [top, bottom] as CFArray, locations: [0, 1])!
+        context.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: width, y: height), options: [])
+        for layer in 0..<6 {
+            let x = CGFloat((index * 97 + layer * 211) % width)
+            let y = CGFloat(90 + (index * 53 + layer * 137) % (height - 180))
+            let radius = CGFloat(100 + (index * 31 + layer * 47) % 260)
+            context.setFillColor(NSColor(white: 1, alpha: 0.035 + CGFloat(layer) * 0.012).cgColor)
+            context.fillEllipse(in: CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
+        }
+        guard let cgImage = context.makeImage(), let destinationRef = CGImageDestinationCreateWithURL(destination as CFURL, UTType.png.identifier as CFString, 1, nil) else { throw ProviderError.noData }
+        CGImageDestinationAddImage(destinationRef, cgImage, nil)
+        guard CGImageDestinationFinalize(destinationRef) else { throw ProviderError.noData }
+        return destination
+    }
+}
+
 // MARK: - Cache and desktop integration
 
 final class WallpaperManager {
@@ -117,7 +219,7 @@ final class WallpaperManager {
 
     func update() async -> Result<WallpaperImage, Error> {
         let preferred = settingsStore.settings.source
-        let providers: [WallpaperProvider] = [provider(for: preferred), provider(for: .bing), provider(for: .unsplash), provider(for: .picsum)]
+        let providers: [WallpaperProvider] = [provider(for: preferred), provider(for: .bing), provider(for: .unsplash), provider(for: .wikimedia), provider(for: .picsum), provider(for: .builtin)]
         var seen = Set<WallpaperSource>()
         for provider in providers where seen.insert(provider.source).inserted {
             do {
@@ -132,7 +234,15 @@ final class WallpaperManager {
         return .failure(ProviderError.noData)
     }
 
-    private func provider(for source: WallpaperSource) -> WallpaperProvider { switch source { case .bing: return BingProvider(); case .unsplash: return UnsplashProvider(); case .picsum: return PicsumProvider() } }
+    private func provider(for source: WallpaperSource) -> WallpaperProvider {
+        switch source {
+        case .bing: return BingProvider()
+        case .unsplash: return UnsplashProvider()
+        case .wikimedia: return WikimediaProvider()
+        case .picsum: return PicsumProvider()
+        case .builtin: return BuiltInProvider(language: settingsStore.settings.language)
+        }
+    }
 
     private func download(_ image: WallpaperImage) async throws -> URL {
         // URLSession's download API streams to a temporary file, keeping peak memory
@@ -238,15 +348,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rebuildMenu() {
-        let menu = NSMenu(); let state = manager.lastImage?.title ?? statusTitle
+        let english = store.settings.language == .english
+        let menu = NSMenu(); let state = manager.lastImage?.title ?? (english ? "Preparing…" : statusTitle)
         menu.addItem(withTitle: state, action: nil, keyEquivalent: "")
-        menu.addItem(.separator()); menu.addItem(withTitle: "立即更新", action: #selector(updateNow), keyEquivalent: "u")
-        let pause = menu.addItem(withTitle: store.settings.pauseUpdates ? "恢复自动更新" : "暂停自动更新", action: #selector(togglePause), keyEquivalent: "p"); pause.target = self
-        let source = NSMenuItem(title: "壁纸来源：\(store.settings.source.title)", action: nil, keyEquivalent: ""); let sourceMenu = NSMenu(); WallpaperSource.allCases.forEach { item in let child = NSMenuItem(title: item.title, action: #selector(selectSource(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; sourceMenu.addItem(child) }; source.submenu = sourceMenu; menu.addItem(source)
-        let strategy = NSMenuItem(title: "更新策略：\(store.settings.strategy.title)", action: nil, keyEquivalent: ""); let strategyMenu = NSMenu(); UpdateStrategy.allCases.forEach { item in let child = NSMenuItem(title: item.title, action: #selector(selectStrategy(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; strategyMenu.addItem(child) }; strategy.submenu = strategyMenu; menu.addItem(strategy)
-        let cadence = NSMenuItem(title: "间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
-        menu.addItem(.separator()); let folder = menu.addItem(withTitle: "打开缓存目录", action: #selector(openCache), keyEquivalent: ""); folder.target = self
-        let quit = menu.addItem(withTitle: "退出 Wallpaper", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self
+        menu.addItem(.separator()); menu.addItem(withTitle: english ? "Update now" : "立即更新", action: #selector(updateNow), keyEquivalent: "u")
+        let pause = menu.addItem(withTitle: store.settings.pauseUpdates ? (english ? "Resume updates" : "恢复自动更新") : (english ? "Pause updates" : "暂停自动更新"), action: #selector(togglePause), keyEquivalent: "p"); pause.target = self
+        let source = NSMenuItem(title: (english ? "Source: " : "壁纸来源：") + store.settings.source.title(for: store.settings.language), action: nil, keyEquivalent: ""); let sourceMenu = NSMenu(); WallpaperSource.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectSource(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; sourceMenu.addItem(child) }; source.submenu = sourceMenu; menu.addItem(source)
+        let strategy = NSMenuItem(title: (english ? "Strategy: " : "更新策略：") + store.settings.strategy.title(for: store.settings.language), action: nil, keyEquivalent: ""); let strategyMenu = NSMenu(); UpdateStrategy.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectStrategy(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; strategyMenu.addItem(child) }; strategy.submenu = strategyMenu; menu.addItem(strategy)
+        let cadence = NSMenuItem(title: english ? "Interval: \(store.settings.intervalMinutes) min" : "间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: english ? "Every \(minutes) minutes" : "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
+        let language = NSMenuItem(title: english ? "Language: English" : "语言：中文", action: nil, keyEquivalent: ""); let languageMenu = NSMenu(); AppLanguage.allCases.forEach { value in let child = NSMenuItem(title: value == .english ? "English" : "中文", action: #selector(selectLanguage(_:)), keyEquivalent: ""); child.representedObject = value.rawValue; child.target = self; languageMenu.addItem(child) }; language.submenu = languageMenu; menu.addItem(language)
+        menu.addItem(.separator()); let folder = menu.addItem(withTitle: english ? "Open cache folder" : "打开缓存目录", action: #selector(openCache), keyEquivalent: ""); folder.target = self
+        let quit = menu.addItem(withTitle: english ? "Quit Wallpaper" : "退出 Wallpaper", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self
         statusItem.menu = menu
     }
 
@@ -255,6 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func selectSource(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let source = WallpaperSource(rawValue: raw) { store.mutate { $0.source = source }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectStrategy(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let strategy = UpdateStrategy(rawValue: raw) { store.mutate { $0.strategy = strategy }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectInterval(_ sender: NSMenuItem) { if let minutes = sender.representedObject as? Int { store.mutate { $0.intervalMinutes = minutes }; scheduler.reschedule(); rebuildMenu() } }
+    @objc private func selectLanguage(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let language = AppLanguage(rawValue: raw) { store.mutate { $0.language = language }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func openCache() { NSWorkspace.shared.open(manager.cacheDirectory) }
     @objc private func quitApp() { NSApp.terminate(nil) }
     private func showError() { NSSound.beep() }
