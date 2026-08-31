@@ -276,6 +276,13 @@ final class WallpaperManager {
         lastError = nil
     }
 
+    func apply(image: WallpaperImage) async throws {
+        let localURL = image.url.isFileURL ? image.url : try await download(image)
+        try setDesktop(url: localURL)
+        lastImage = image
+        lastError = nil
+    }
+
     func cachePreview(_ image: WallpaperImage) async throws -> URL {
         let previewDirectory = cacheDirectory.appendingPathComponent("Preview", isDirectory: true)
         try fileManager.createDirectory(at: previewDirectory, withIntermediateDirectories: true)
@@ -307,77 +314,20 @@ final class SettingsStore {
     func mutate(_ change: (inout AppSettings) -> Void) { var copy = settings; change(&copy); settings = copy }
 }
 
-// MARK: - Scheduler
-
-final class Scheduler {
-    private var timer: Timer?
-    private var networkMonitor: NWPathMonitor?
-    private var networkWasSatisfied = false
-    private var lastDailyTrigger: String?
-    private var lastRandomDay: Int?
-    private var randomTargetDay: Int?
-    private var randomTargetMinute: Int?
-    private weak var delegate: AppDelegate?
-    init(delegate: AppDelegate) { self.delegate = delegate }
-    func reschedule() {
-        timer?.invalidate(); timer = nil
-        networkMonitor?.cancel(); networkMonitor = nil
-        let settings = delegate?.store.settings ?? AppSettings()
-        guard !settings.pauseUpdates else { return }
-        switch settings.strategy {
-        case .manual: break
-        case .onLaunch: Task { await delegate?.performUpdate() }
-        case .interval:
-            timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(max(5, settings.intervalMinutes) * 60), repeats: true) { [weak self] _ in Task { await self?.delegate?.performUpdate() } }
-        case .daily, .randomWindow:
-            timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.checkTimeWindow() }
-        case .networkChange:
-            let monitor = NWPathMonitor()
-            networkMonitor = monitor
-            monitor.pathUpdateHandler = { [weak self] path in
-                let recovered = path.status == .satisfied && self?.networkWasSatisfied == false
-                self?.networkWasSatisfied = path.status == .satisfied
-                if recovered { Task { await self?.delegate?.performUpdate() } }
-            }
-            monitor.start(queue: DispatchQueue(label: "Wallpaper.NetworkMonitor", qos: .utility))
-        }
-    }
-    private func checkTimeWindow() {
-        guard let delegate else { return }; let s = delegate.store.settings; let now = Calendar.current.dateComponents([.hour, .minute], from: Date()); let hour = now.hour ?? 0
-        if s.strategy == .daily, hour == s.dailyHour, (now.minute ?? -1) == s.dailyMinute {
-            let key = "\(Calendar.current.component(.year, from: Date()))-\(Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0)"
-            guard lastDailyTrigger != key else { return }
-            lastDailyTrigger = key
-            Task { await delegate.performUpdate() }
-        }
-        let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
-        let minuteOfDay = hour * 60 + (now.minute ?? 0)
-        if s.strategy == .randomWindow {
-            if randomTargetDay != day {
-                randomTargetDay = day
-                let start = max(0, min(23, s.randomStartHour)) * 60
-                let end = max(start + 1, min(24 * 60, s.randomEndHour * 60))
-                randomTargetMinute = Int.random(in: start..<end)
-            }
-            if let target = randomTargetMinute, minuteOfDay >= target, lastRandomDay != day {
-                lastRandomDay = day
-                Task { await delegate.performUpdate() }
-            }
-        }
-    }
-}
-
 // MARK: - Menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = SettingsStore()
     private var statusItem: NSStatusItem!
-    private var scheduler: Scheduler!
+    private var scheduler: ChangeScheduler!
     private var welcomeWindow: NSWindow?
     private var previewURLs: [URL] = []
+    private var previewCandidates: [WallpaperImage] = []
     private var previewTitles: [String] = []
     private var previewSources: [WallpaperSource] = []
     private var previewButtons: [NSButton] = []
+    private var previewLabels: [NSTextField] = []
+    private weak var panelStatusLabel: NSTextField?
     private lazy var manager = WallpaperManager(settingsStore: store)
     private let statusTitle = "正在准备…"
 
@@ -390,17 +340,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem.button?.title = store.settings.language == .english ? " Wallpaper" : " 壁纸"
         statusItem.button?.toolTip = store.settings.language == .english ? "Wallpaper" : "壁纸"
-        scheduler = Scheduler(delegate: self); scheduler.reschedule(); rebuildMenu()
-        Task { await performUpdate() }
+        scheduler = ChangeScheduler(settingsProvider: { [weak self] in self?.store.settings ?? AppSettings() }, changeHandler: { [weak self] _ in Task { await self?.performUpdate() } })
+        scheduler.start(); rebuildMenu()
         if !UserDefaults.standard.bool(forKey: "Wallpaper.HasShownWelcome") { showWelcome() }
     }
 
-    func performUpdate() async {
-        guard !store.settings.pauseUpdates else { return }
+    func performUpdate(manual: Bool = false) async {
+        guard manual || !store.settings.pauseUpdates else { return }
+        await MainActor.run { [weak self] in self?.panelStatusLabel?.stringValue = self?.store.settings.language == .english ? "Fetching from preferred source…" : "正在从首选来源获取…" }
         let result = await manager.update()
         await MainActor.run { [weak self] in
             guard let self else { return }; self.rebuildMenu()
-            if case .failure = result { self.showError() }
+            switch result {
+            case .success(let image): self.panelStatusLabel?.stringValue = (self.store.settings.language == .english ? "Changed: " : "已更换：") + image.source.title(for: self.store.settings.language)
+            case .failure: self.panelStatusLabel?.stringValue = self.store.settings.language == .english ? "All sources failed. Current wallpaper was kept." : "所有来源均失败，已保留当前壁纸。"; self.showError()
+            }
         }
     }
 
@@ -410,7 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: state, action: nil, keyEquivalent: "")
         menu.addItem(.separator()); menu.addItem(withTitle: english ? "Update now" : "立即更新", action: #selector(updateNow), keyEquivalent: "u")
         let pause = menu.addItem(withTitle: store.settings.pauseUpdates ? (english ? "Resume updates" : "恢复自动更新") : (english ? "Pause updates" : "暂停自动更新"), action: #selector(togglePause), keyEquivalent: "p"); pause.target = self
-        let source = NSMenuItem(title: (english ? "Source: " : "壁纸来源：") + store.settings.source.title(for: store.settings.language), action: nil, keyEquivalent: ""); let sourceMenu = NSMenu(); WallpaperSource.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectSource(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; sourceMenu.addItem(child) }; source.submenu = sourceMenu; menu.addItem(source)
+        let source = NSMenuItem(title: (english ? "Preferred source: " : "首选来源：") + store.settings.source.title(for: store.settings.language), action: nil, keyEquivalent: ""); let sourceMenu = NSMenu(); WallpaperSource.allCases.forEach { item in let child = NSMenuItem(title: item.selectionDescription(for: store.settings.language), action: #selector(selectSource(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; sourceMenu.addItem(child) }; source.submenu = sourceMenu; menu.addItem(source)
         let strategy = NSMenuItem(title: (english ? "Change timing: " : "更换时机：") + store.settings.strategy.title(for: store.settings.language), action: nil, keyEquivalent: ""); let strategyMenu = NSMenu(); UpdateStrategy.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectStrategy(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; strategyMenu.addItem(child) }; strategy.submenu = strategyMenu; menu.addItem(strategy)
         if store.settings.strategy == .interval {
             let cadence = NSMenuItem(title: english ? "Change interval: \(store.settings.intervalMinutes) min" : "更换间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: english ? "Every \(minutes) minutes" : "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
@@ -430,54 +384,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc private func updateNow() { Task { await performUpdate() } }
+    @objc private func updateNow() { Task { await performUpdate(manual: true) } }
     @objc private func togglePause() { store.mutate { $0.pauseUpdates.toggle() }; scheduler.reschedule(); rebuildMenu() }
-    @objc private func selectSource(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let source = WallpaperSource(rawValue: raw) { store.mutate { $0.source = source }; scheduler.reschedule(); rebuildMenu() } }
+    @objc private func selectSource(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let source = WallpaperSource(rawValue: raw) { store.mutate { $0.source = source }; scheduler.reschedule(); rebuildMenu(); reloadVisiblePanel() } }
     @objc private func selectStrategy(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let strategy = UpdateStrategy(rawValue: raw) { store.mutate { $0.strategy = strategy }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectInterval(_ sender: NSMenuItem) { if let minutes = sender.representedObject as? Int { store.mutate { $0.intervalMinutes = minutes }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectDailyTime(_ sender: NSMenuItem) { if let hour = sender.representedObject as? Int { store.mutate { $0.dailyHour = hour; $0.dailyMinute = 0 }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectRandomWindow(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String { let parts = raw.split(separator: "-").compactMap { Int($0) }; if parts.count == 2 { store.mutate { $0.randomStartHour = parts[0]; $0.randomEndHour = parts[1] }; scheduler.reschedule(); rebuildMenu() } } }
-    @objc private func selectLanguage(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let language = AppLanguage(rawValue: raw) { store.mutate { $0.language = language }; scheduler.reschedule(); rebuildMenu() } }
+    @objc private func selectLanguage(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let language = AppLanguage(rawValue: raw) { store.mutate { $0.language = language }; scheduler.reschedule(); rebuildMenu(); reloadVisiblePanel() } }
     @objc private func openWelcome() { showWelcome() }
     @objc private func openCache() { NSWorkspace.shared.open(manager.cacheDirectory) }
     @objc private func quitApp() { NSApp.terminate(nil) }
     private func showError() { NSSound.beep() }
+    private func reloadVisiblePanel() {
+        guard welcomeWindow?.isVisible == true else { return }
+        welcomeWindow?.orderOut(nil); welcomeWindow = nil; showWelcome()
+    }
 
     private func showWelcome() {
         if let existing = welcomeWindow, existing.isVisible { existing.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         let english = store.settings.language == .english
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 520), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 600), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Wallpaper"
         window.isReleasedWhenClosed = false
         let label = NSTextField(labelWithString: english ? "Choose a wallpaper" : "选择壁纸")
-        label.frame = NSRect(x: 32, y: 455, width: 456, height: 28)
+        label.frame = NSRect(x: 32, y: 535, width: 456, height: 28)
         label.alignment = .center
         label.font = .systemFont(ofSize: 20, weight: .semibold)
         let hint = NSTextField(labelWithString: english ? "Low-resolution previews · click one to change your desktop" : "低清缩略图 · 点击即可更换当前桌面")
-        hint.frame = NSRect(x: 32, y: 428, width: 456, height: 20); hint.alignment = .center; hint.textColor = .secondaryLabelColor; hint.font = .systemFont(ofSize: 12)
-        let grid = NSView(frame: NSRect(x: 30, y: 92, width: 460, height: 320))
-        let provider = BuiltInProvider(language: store.settings.language)
+        hint.frame = NSRect(x: 32, y: 510, width: 456, height: 20); hint.alignment = .center; hint.textColor = .secondaryLabelColor; hint.font = .systemFont(ofSize: 12)
+        let sourceInfo = NSTextField(labelWithString: store.settings.source.selectionDescription(for: store.settings.language))
+        sourceInfo.frame = NSRect(x: 32, y: 484, width: 456, height: 20); sourceInfo.alignment = .center; sourceInfo.textColor = .secondaryLabelColor; sourceInfo.font = .systemFont(ofSize: 11)
+        let grid = NSView(frame: NSRect(x: 30, y: 150, width: 460, height: 320))
         let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
-        previewURLs = []; previewTitles = []; previewSources = []; previewButtons = []
+        let initialCandidates = WallpaperSourceCatalog.builtInCandidates(language: store.settings.language, start: day - 1, limit: 9)
+        previewURLs = []; previewCandidates = []; previewTitles = []; previewSources = []; previewButtons = []; previewLabels = []
         for offset in 0..<9 {
             let row = offset / 3, column = offset % 3
             let cell = NSView(frame: NSRect(x: CGFloat(column) * 150, y: CGFloat(2 - row) * 104, width: 140, height: 94))
             cell.wantsLayer = true; cell.layer?.cornerRadius = 10; cell.layer?.masksToBounds = true
             let imageView = NSImageView(frame: cell.bounds); imageView.imageScaling = .scaleAxesIndependently; imageView.autoresizingMask = [.width, .height]
-            let index = (day - 1 + offset) % 120
-            if let url = try? provider.fileURL(index: index) { imageView.image = thumbnail(for: url) }
+            let candidate = initialCandidates[offset]
+            imageView.image = PreviewSupport.image(at: candidate.previewURL)
             cell.addSubview(imageView)
+            let sourceLabel = NSTextField(labelWithString: candidate.source.title(for: store.settings.language))
+            sourceLabel.frame = NSRect(x: 5, y: 5, width: 130, height: 16); sourceLabel.font = .systemFont(ofSize: 10, weight: .medium); sourceLabel.textColor = .white; sourceLabel.drawsBackground = true; sourceLabel.backgroundColor = NSColor.black.withAlphaComponent(0.55); sourceLabel.isBordered = false; sourceLabel.lineBreakMode = .byTruncatingTail; sourceLabel.alignment = .center; cell.addSubview(sourceLabel)
             let button = NSButton(frame: cell.bounds)
             button.isBordered = false; button.title = ""; button.target = self; button.action = #selector(selectPreview(_:)); button.autoresizingMask = [.width, .height]
             button.tag = offset
-            if let url = try? provider.fileURL(index: index) { previewURLs.append(url) } else { previewURLs.append(URL(fileURLWithPath: "/")) }
-            previewTitles.append(english ? "Built-in wallpaper #\(index + 1)" : "内置壁纸 #\(index + 1)"); previewSources.append(.builtin); previewButtons.append(button)
+            previewURLs.append(candidate.image.url); previewCandidates.append(candidate.image)
+            previewTitles.append(candidate.title); previewSources.append(candidate.source); previewButtons.append(button); previewLabels.append(sourceLabel)
             cell.addSubview(button); grid.addSubview(cell)
         }
-        let update = NSButton(title: english ? "Fetch latest" : "获取最新壁纸", target: self, action: #selector(updateNow)); update.frame = NSRect(x: 78, y: 38, width: 150, height: 34)
-        let close = NSButton(title: english ? "Close" : "关闭", target: self, action: #selector(closeWelcome)); close.frame = NSRect(x: 292, y: 38, width: 150, height: 34)
-        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 520))
-        window.contentView?.addSubview(label); window.contentView?.addSubview(hint); window.contentView?.addSubview(grid); window.contentView?.addSubview(update); window.contentView?.addSubview(close)
+        let status = NSTextField(labelWithString: english ? "Loading candidates…" : "正在加载候选壁纸…")
+        status.frame = NSRect(x: 32, y: 112, width: 456, height: 20); status.alignment = .center; status.textColor = .secondaryLabelColor; status.font = .systemFont(ofSize: 11); panelStatusLabel = status
+        let update = NSButton(title: english ? "Fetch and change now" : "立即获取并更换", target: self, action: #selector(updateNow)); update.frame = NSRect(x: 78, y: 48, width: 150, height: 34)
+        let close = NSButton(title: english ? "Close" : "关闭", target: self, action: #selector(closeWelcome)); close.frame = NSRect(x: 292, y: 48, width: 150, height: 34)
+        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 600))
+        window.contentView?.addSubview(label); window.contentView?.addSubview(hint); window.contentView?.addSubview(sourceInfo); window.contentView?.addSubview(grid); window.contentView?.addSubview(status); window.contentView?.addSubview(update); window.contentView?.addSubview(close)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         welcomeWindow = window
         Task { await loadOnlinePreviews() }
@@ -487,25 +451,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSImage(cgImage: image, size: NSSize(width: 140, height: 86))
     }
     private func loadOnlinePreviews() async {
-        var candidates: [WallpaperImage] = []
-        if let bing = try? await BingProvider().fetchMany(limit: 8) { candidates.append(contentsOf: bing) }
-        if candidates.count < 9, let unsplash = try? await UnsplashProvider().fetch() { candidates.append(unsplash) }
-        for (index, candidate) in candidates.prefix(9).enumerated() {
-            guard let localURL = try? await manager.cachePreview(candidate), let image = thumbnail(for: localURL) else { continue }
+        let candidates = await WallpaperSourceCatalog.candidates(preferred: store.settings.source, language: store.settings.language, limit: 9)
+        let cached = await PreviewSupport.cache(candidates: candidates, in: manager.cacheDirectory, maxPixelSize: PreviewSupport.defaultMaxPixelSize)
+        PreviewSupport.prunePreviewCache(in: manager.cacheDirectory)
+        let sourceLabel = store.settings.source.title(for: store.settings.language)
+        await MainActor.run { [weak self] in
+            guard let self else { return }
+            self.panelStatusLabel?.stringValue = cached.isEmpty
+                ? (self.store.settings.language == .english ? "Offline fallback: built-in wallpapers" : "在线来源不可用，当前为内置离线壁纸")
+                : (self.store.settings.language == .english ? "Previewing candidates · preferred: \(sourceLabel)" : "候选已加载 · 首选来源：\(sourceLabel)")
+        }
+        for (index, pair) in cached.enumerated() {
+            let candidate = pair.0.image
+            let localURL = pair.1
+            guard let image = PreviewSupport.image(at: localURL) else { continue }
             await MainActor.run { [weak self] in
                 guard let self, index < self.previewButtons.count else { return }
-                self.previewURLs[index] = localURL; self.previewTitles[index] = candidate.title; self.previewSources[index] = candidate.source
-                self.previewButtons[index].image = image; self.previewButtons[index].toolTip = candidate.title
+                self.previewURLs[index] = candidate.url; self.previewCandidates[index] = candidate; self.previewTitles[index] = candidate.title; self.previewSources[index] = candidate.source
+                self.previewButtons[index].image = image; self.previewLabels[index].stringValue = candidate.source.title(for: self.store.settings.language); self.previewButtons[index].toolTip = "\(candidate.source.title(for: self.store.settings.language)) · \(candidate.title)"
             }
         }
     }
     @objc private func selectPreview(_ sender: NSButton) {
         guard sender.tag >= 0, sender.tag < previewURLs.count else { return }
-        do {
-            let url = previewURLs[sender.tag]
-            try manager.apply(localURL: url, title: previewTitles[sender.tag], source: previewSources[sender.tag])
-            rebuildMenu()
-        } catch { showError() }
+        let candidate = previewCandidates[sender.tag]
+        Task {
+            do { try await manager.apply(image: candidate); await MainActor.run { [weak self] in self?.rebuildMenu() } }
+            catch { await MainActor.run { [weak self] in self?.showError() } }
+        }
     }
     @objc private func closeWelcome() { welcomeWindow?.orderOut(nil); UserDefaults.standard.set(true, forKey: "Wallpaper.HasShownWelcome") }
 }
