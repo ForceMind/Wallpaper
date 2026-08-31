@@ -323,19 +323,26 @@ final class Scheduler {
 
 // MARK: - Menu bar app
 
-@main
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = SettingsStore()
     private var statusItem: NSStatusItem!
     private var scheduler: Scheduler!
+    private var welcomeWindow: NSWindow?
     private lazy var manager = WallpaperManager(settingsStore: store)
     private let statusTitle = "正在准备…"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "壁纸")
+        if let image = NSImage(systemSymbolName: "photo.on.rectangle", accessibilityDescription: "Wallpaper") {
+            image.isTemplate = true
+            statusItem.button?.image = image
+        }
+        statusItem.button?.title = store.settings.language == .english ? " Wallpaper" : " 壁纸"
+        statusItem.button?.toolTip = store.settings.language == .english ? "Wallpaper" : "壁纸"
         scheduler = Scheduler(delegate: self); scheduler.reschedule(); rebuildMenu()
+        Task { await performUpdate() }
+        if !UserDefaults.standard.bool(forKey: "Wallpaper.HasShownWelcome") { showWelcome() }
     }
 
     func performUpdate() async {
@@ -357,6 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let strategy = NSMenuItem(title: (english ? "Strategy: " : "更新策略：") + store.settings.strategy.title(for: store.settings.language), action: nil, keyEquivalent: ""); let strategyMenu = NSMenu(); UpdateStrategy.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectStrategy(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; strategyMenu.addItem(child) }; strategy.submenu = strategyMenu; menu.addItem(strategy)
         let cadence = NSMenuItem(title: english ? "Interval: \(store.settings.intervalMinutes) min" : "间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: english ? "Every \(minutes) minutes" : "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
         let language = NSMenuItem(title: english ? "Language: English" : "语言：中文", action: nil, keyEquivalent: ""); let languageMenu = NSMenu(); AppLanguage.allCases.forEach { value in let child = NSMenuItem(title: value == .english ? "English" : "中文", action: #selector(selectLanguage(_:)), keyEquivalent: ""); child.representedObject = value.rawValue; child.target = self; languageMenu.addItem(child) }; language.submenu = languageMenu; menu.addItem(language)
+        menu.addItem(withTitle: english ? "Open control panel" : "打开控制面板", action: #selector(openWelcome), keyEquivalent: "").target = self
         menu.addItem(.separator()); let folder = menu.addItem(withTitle: english ? "Open cache folder" : "打开缓存目录", action: #selector(openCache), keyEquivalent: ""); folder.target = self
         let quit = menu.addItem(withTitle: english ? "Quit Wallpaper" : "退出 Wallpaper", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self
         statusItem.menu = menu
@@ -368,7 +376,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func selectStrategy(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let strategy = UpdateStrategy(rawValue: raw) { store.mutate { $0.strategy = strategy }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectInterval(_ sender: NSMenuItem) { if let minutes = sender.representedObject as? Int { store.mutate { $0.intervalMinutes = minutes }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectLanguage(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let language = AppLanguage(rawValue: raw) { store.mutate { $0.language = language }; scheduler.reschedule(); rebuildMenu() } }
+    @objc private func openWelcome() { showWelcome() }
     @objc private func openCache() { NSWorkspace.shared.open(manager.cacheDirectory) }
     @objc private func quitApp() { NSApp.terminate(nil) }
     private func showError() { NSSound.beep() }
+
+    private func showWelcome() {
+        let english = store.settings.language == .english
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 210), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Wallpaper"
+        window.isReleasedWhenClosed = false
+        let label = NSTextField(labelWithString: english ? "Wallpaper is running in the menu bar.\nIt will update your desktop automatically." : "Wallpaper 已在菜单栏运行。\n它会自动更新你的桌面壁纸。")
+        label.frame = NSRect(x: 32, y: 105, width: 356, height: 54)
+        label.alignment = .center
+        label.font = .systemFont(ofSize: 15, weight: .medium)
+        label.maximumNumberOfLines = 2
+        let update = NSButton(title: english ? "Update now" : "立即更新", target: self, action: #selector(updateNow))
+        update.frame = NSRect(x: 90, y: 42, width: 110, height: 34)
+        let close = NSButton(title: english ? "Close" : "关闭", target: self, action: #selector(closeWelcome))
+        close.frame = NSRect(x: 220, y: 42, width: 110, height: 34)
+        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 210))
+        window.contentView?.addSubview(label); window.contentView?.addSubview(update); window.contentView?.addSubview(close)
+        window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        welcomeWindow = window
+    }
+    @objc private func closeWelcome() { welcomeWindow?.orderOut(nil); UserDefaults.standard.set(true, forKey: "Wallpaper.HasShownWelcome") }
 }
+
+// Explicit AppKit entry point. Keeping the application/delegate wiring here
+// avoids a silent background process when the compiler does not synthesize
+// NSApplicationMain for an @main delegate class.
+let application = NSApplication.shared
+let appDelegate = AppDelegate()
+application.delegate = appDelegate
+application.run()
