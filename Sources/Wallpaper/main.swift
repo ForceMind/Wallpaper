@@ -315,6 +315,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewSources: [WallpaperSource] = []
     private var previewButtons: [NSButton] = []
     private var previewLabels: [NSTextField] = []
+    private var previewCells: [NSView] = []
+    private var previewMarks: [NSImageView] = []
+    private var selectedPreviewIndex: Int?
     private weak var panelStatusLabel: NSTextField?
     private lazy var manager = WallpaperManager(settingsStore: store)
     private let statusTitle = "正在准备…"
@@ -406,22 +409,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let grid = NSView(frame: NSRect(x: 30, y: 150, width: 460, height: 320))
         let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
         let initialCandidates = WallpaperSourceCatalog.builtInCandidates(language: store.settings.language, start: day - 1, limit: 9)
-        previewURLs = []; previewCandidates = []; previewTitles = []; previewSources = []; previewButtons = []; previewLabels = []
+        previewURLs = []; previewCandidates = []; previewTitles = []; previewSources = []; previewButtons = []; previewLabels = []; previewCells = []; previewMarks = []; selectedPreviewIndex = nil
         for offset in 0..<9 {
             let row = offset / 3, column = offset % 3
             let cell = NSView(frame: NSRect(x: CGFloat(column) * 150, y: CGFloat(2 - row) * 104, width: 140, height: 94))
-            cell.wantsLayer = true; cell.layer?.cornerRadius = 10; cell.layer?.masksToBounds = true
+            cell.wantsLayer = true; cell.layer?.cornerRadius = 10; cell.layer?.masksToBounds = true; cell.layer?.borderWidth = 0; cell.layer?.borderColor = NSColor.controlAccentColor.cgColor
             let imageView = NSImageView(frame: cell.bounds); imageView.imageScaling = .scaleAxesIndependently; imageView.autoresizingMask = [.width, .height]
             let candidate = initialCandidates[offset]
             imageView.image = PreviewSupport.image(at: candidate.previewURL)
             cell.addSubview(imageView)
             let sourceLabel = NSTextField(labelWithString: candidate.source.title(for: store.settings.language))
             sourceLabel.frame = NSRect(x: 5, y: 5, width: 130, height: 16); sourceLabel.font = .systemFont(ofSize: 10, weight: .medium); sourceLabel.textColor = .white; sourceLabel.drawsBackground = true; sourceLabel.backgroundColor = NSColor.black.withAlphaComponent(0.55); sourceLabel.isBordered = false; sourceLabel.lineBreakMode = .byTruncatingTail; sourceLabel.alignment = .center; cell.addSubview(sourceLabel)
+            let mark = NSImageView(frame: NSRect(x: 112, y: 68, width: 22, height: 22)); mark.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: "Selected"); mark.contentTintColor = .controlAccentColor; mark.isHidden = true; cell.addSubview(mark)
             let button = NSButton(frame: cell.bounds)
             button.isBordered = false; button.title = ""; button.target = self; button.action = #selector(selectPreview(_:)); button.autoresizingMask = [.width, .height]
             button.tag = offset
             previewURLs.append(candidate.image.url); previewCandidates.append(candidate.image)
-            previewTitles.append(candidate.title); previewSources.append(candidate.source); previewButtons.append(button); previewLabels.append(sourceLabel)
+            previewTitles.append(candidate.title); previewSources.append(candidate.source); previewButtons.append(button); previewLabels.append(sourceLabel); previewCells.append(cell); previewMarks.append(mark)
             cell.addSubview(button); grid.addSubview(cell)
         }
         let status = NSTextField(labelWithString: english ? "Loading candidates…" : "正在加载候选壁纸…")
@@ -458,10 +462,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func selectPreview(_ sender: NSButton) {
         guard sender.tag >= 0, sender.tag < previewURLs.count else { return }
+        let previousSelection = selectedPreviewIndex
+        selectedPreviewIndex = sender.tag
+        for (index, cell) in previewCells.enumerated() { cell.layer?.borderWidth = index == sender.tag ? 3 : 0; previewMarks[index].isHidden = index != sender.tag }
+        panelStatusLabel?.textColor = .secondaryLabelColor
+        panelStatusLabel?.stringValue = store.settings.language == .english ? "Changing wallpaper…" : "正在更换壁纸…"
         let candidate = previewCandidates[sender.tag]
         Task {
-            do { try await manager.apply(image: candidate); await MainActor.run { [weak self] in self?.rebuildMenu() } }
-            catch { await MainActor.run { [weak self] in self?.showError() } }
+            do {
+                try await manager.apply(image: candidate)
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.rebuildMenu(); self.panelStatusLabel?.textColor = .systemGreen
+                    self.panelStatusLabel?.stringValue = (self.store.settings.language == .english ? "Changed: " : "已更换：") + candidate.source.title(for: self.store.settings.language)
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.selectedPreviewIndex = previousSelection
+                    for (index, cell) in self.previewCells.enumerated() { cell.layer?.borderWidth = index == previousSelection ? 3 : 0; self.previewMarks[index].isHidden = index != previousSelection }
+                    self.panelStatusLabel?.textColor = .systemRed
+                    self.panelStatusLabel?.stringValue = self.store.settings.language == .english ? "Change failed. Try another wallpaper." : "更换失败，请尝试其他壁纸。"
+                    self.showError()
+                }
+            }
         }
     }
     @objc private func closeWelcome() { welcomeWindow?.orderOut(nil); UserDefaults.standard.set(true, forKey: "Wallpaper.HasShownWelcome") }
