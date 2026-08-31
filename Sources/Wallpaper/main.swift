@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ImageIO
+import Network
 import UniformTypeIdentifiers
 
 // MARK: - Domain
@@ -28,7 +29,7 @@ enum UpdateStrategy: String, CaseIterable, Codable {
         case .interval: return language == .english ? "Fixed interval" : "固定间隔"
         case .daily: return language == .english ? "Daily schedule" : "每日定时"
         case .onLaunch: return language == .english ? "On launch" : "启动时"
-        case .networkChange: return language == .english ? "Network polling" : "网络变化"
+        case .networkChange: return language == .english ? "When network recovers" : "网络恢复"
         case .randomWindow: return language == .english ? "Random window" : "随机时间窗"
         }
     }
@@ -292,12 +293,17 @@ final class SettingsStore {
 
 final class Scheduler {
     private var timer: Timer?
+    private var networkMonitor: NWPathMonitor?
+    private var networkWasSatisfied = false
     private var lastDailyTrigger: String?
     private var lastRandomDay: Int?
+    private var randomTargetDay: Int?
+    private var randomTargetMinute: Int?
     private weak var delegate: AppDelegate?
     init(delegate: AppDelegate) { self.delegate = delegate }
     func reschedule() {
         timer?.invalidate(); timer = nil
+        networkMonitor?.cancel(); networkMonitor = nil
         let settings = delegate?.store.settings ?? AppSettings()
         guard !settings.pauseUpdates else { return }
         switch settings.strategy {
@@ -308,7 +314,14 @@ final class Scheduler {
         case .daily, .randomWindow:
             timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.checkTimeWindow() }
         case .networkChange:
-            timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in Task { await self?.delegate?.performUpdate() } }
+            let monitor = NWPathMonitor()
+            networkMonitor = monitor
+            monitor.pathUpdateHandler = { [weak self] path in
+                let recovered = path.status == .satisfied && self?.networkWasSatisfied == false
+                self?.networkWasSatisfied = path.status == .satisfied
+                if recovered { Task { await self?.delegate?.performUpdate() } }
+            }
+            monitor.start(queue: DispatchQueue(label: "Wallpaper.NetworkMonitor", qos: .utility))
         }
     }
     private func checkTimeWindow() {
@@ -319,10 +332,19 @@ final class Scheduler {
             lastDailyTrigger = key
             Task { await delegate.performUpdate() }
         }
-        if s.strategy == .randomWindow, hour >= s.randomStartHour, hour < s.randomEndHour,
-           lastRandomDay != (Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0), Bool.random() {
-            lastRandomDay = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
-            Task { await delegate.performUpdate() }
+        let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
+        let minuteOfDay = hour * 60 + (now.minute ?? 0)
+        if s.strategy == .randomWindow {
+            if randomTargetDay != day {
+                randomTargetDay = day
+                let start = max(0, min(23, s.randomStartHour)) * 60
+                let end = max(start + 1, min(24 * 60, s.randomEndHour * 60))
+                randomTargetMinute = Int.random(in: start..<end)
+            }
+            if let target = randomTargetMinute, minuteOfDay >= target, lastRandomDay != day {
+                lastRandomDay = day
+                Task { await delegate.performUpdate() }
+            }
         }
     }
 }
@@ -368,7 +390,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pause = menu.addItem(withTitle: store.settings.pauseUpdates ? (english ? "Resume updates" : "恢复自动更新") : (english ? "Pause updates" : "暂停自动更新"), action: #selector(togglePause), keyEquivalent: "p"); pause.target = self
         let source = NSMenuItem(title: (english ? "Source: " : "壁纸来源：") + store.settings.source.title(for: store.settings.language), action: nil, keyEquivalent: ""); let sourceMenu = NSMenu(); WallpaperSource.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectSource(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; sourceMenu.addItem(child) }; source.submenu = sourceMenu; menu.addItem(source)
         let strategy = NSMenuItem(title: (english ? "Change timing: " : "更换时机：") + store.settings.strategy.title(for: store.settings.language), action: nil, keyEquivalent: ""); let strategyMenu = NSMenu(); UpdateStrategy.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectStrategy(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; strategyMenu.addItem(child) }; strategy.submenu = strategyMenu; menu.addItem(strategy)
-        let cadence = NSMenuItem(title: english ? "Change interval: \(store.settings.intervalMinutes) min" : "更换间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: english ? "Every \(minutes) minutes" : "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
+        if store.settings.strategy == .interval {
+            let cadence = NSMenuItem(title: english ? "Change interval: \(store.settings.intervalMinutes) min" : "更换间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: english ? "Every \(minutes) minutes" : "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
+        }
+        if store.settings.strategy == .daily {
+            let schedule = NSMenuItem(title: english ? String(format: "Daily at %02d:%02d", store.settings.dailyHour, store.settings.dailyMinute) : String(format: "每日 %02d:%02d 更换", store.settings.dailyHour, store.settings.dailyMinute), action: nil, keyEquivalent: "")
+            let scheduleMenu = NSMenu(); [8, 9, 12, 18, 21].forEach { hour in let child = NSMenuItem(title: english ? String(format: "%02d:00", hour) : String(format: "%02d:00", hour), action: #selector(selectDailyTime(_:)), keyEquivalent: ""); child.representedObject = hour; child.target = self; scheduleMenu.addItem(child) }; schedule.submenu = scheduleMenu; menu.addItem(schedule)
+        }
+        if store.settings.strategy == .randomWindow {
+            let window = NSMenuItem(title: english ? String(format: "Random window %02d:00–%02d:00", store.settings.randomStartHour, store.settings.randomEndHour) : String(format: "随机窗口 %02d:00–%02d:00", store.settings.randomStartHour, store.settings.randomEndHour), action: nil, keyEquivalent: "")
+            let windowMenu = NSMenu(); [(8, 18), (8, 22), (18, 23)].forEach { range in let child = NSMenuItem(title: english ? String(format: "%02d:00–%02d:00", range.0, range.1) : String(format: "%02d:00–%02d:00", range.0, range.1), action: #selector(selectRandomWindow(_:)), keyEquivalent: ""); child.representedObject = "\(range.0)-\(range.1)"; child.target = self; windowMenu.addItem(child) }; window.submenu = windowMenu; menu.addItem(window)
+        }
         let language = NSMenuItem(title: english ? "Language: English" : "语言：中文", action: nil, keyEquivalent: ""); let languageMenu = NSMenu(); AppLanguage.allCases.forEach { value in let child = NSMenuItem(title: value == .english ? "English" : "中文", action: #selector(selectLanguage(_:)), keyEquivalent: ""); child.representedObject = value.rawValue; child.target = self; languageMenu.addItem(child) }; language.submenu = languageMenu; menu.addItem(language)
         menu.addItem(withTitle: english ? "Open control panel" : "打开控制面板", action: #selector(openWelcome), keyEquivalent: "").target = self
         menu.addItem(.separator()); let folder = menu.addItem(withTitle: english ? "Open cache folder" : "打开缓存目录", action: #selector(openCache), keyEquivalent: ""); folder.target = self
@@ -381,6 +413,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func selectSource(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let source = WallpaperSource(rawValue: raw) { store.mutate { $0.source = source }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectStrategy(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let strategy = UpdateStrategy(rawValue: raw) { store.mutate { $0.strategy = strategy }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func selectInterval(_ sender: NSMenuItem) { if let minutes = sender.representedObject as? Int { store.mutate { $0.intervalMinutes = minutes }; scheduler.reschedule(); rebuildMenu() } }
+    @objc private func selectDailyTime(_ sender: NSMenuItem) { if let hour = sender.representedObject as? Int { store.mutate { $0.dailyHour = hour; $0.dailyMinute = 0 }; scheduler.reschedule(); rebuildMenu() } }
+    @objc private func selectRandomWindow(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String { let parts = raw.split(separator: "-").compactMap { Int($0) }; if parts.count == 2 { store.mutate { $0.randomStartHour = parts[0]; $0.randomEndHour = parts[1] }; scheduler.reschedule(); rebuildMenu() } } }
     @objc private func selectLanguage(_ sender: NSMenuItem) { if let raw = sender.representedObject as? String, let language = AppLanguage(rawValue: raw) { store.mutate { $0.language = language }; scheduler.reschedule(); rebuildMenu() } }
     @objc private func openWelcome() { showWelcome() }
     @objc private func openCache() { NSWorkspace.shared.open(manager.cacheDirectory) }
@@ -404,12 +438,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
         for offset in 0..<9 {
             let row = offset / 3, column = offset % 3
-            let button = NSButton(frame: NSRect(x: CGFloat(column) * 150, y: CGFloat(2 - row) * 104, width: 140, height: 94))
-            button.bezelStyle = .texturedRounded; button.imageScaling = .scaleProportionallyUpOrDown; button.imagePosition = .imageOnly; button.target = self; button.action = #selector(selectPreview(_:))
+            let cell = NSView(frame: NSRect(x: CGFloat(column) * 150, y: CGFloat(2 - row) * 104, width: 140, height: 94))
+            cell.wantsLayer = true; cell.layer?.cornerRadius = 10; cell.layer?.masksToBounds = true
+            let imageView = NSImageView(frame: cell.bounds); imageView.imageScaling = .scaleAxesIndependently; imageView.autoresizingMask = [.width, .height]
             let index = (day - 1 + offset) % 120
+            if let url = try? provider.fileURL(index: index) { imageView.image = thumbnail(for: url) }
+            cell.addSubview(imageView)
+            let button = NSButton(frame: cell.bounds)
+            button.isBordered = false; button.title = ""; button.target = self; button.action = #selector(selectPreview(_:)); button.autoresizingMask = [.width, .height]
             button.tag = index
-            if let url = try? provider.fileURL(index: index) { button.image = thumbnail(for: url) }
-            grid.addSubview(button)
+            cell.addSubview(button); grid.addSubview(cell)
         }
         let update = NSButton(title: english ? "Fetch latest" : "获取最新壁纸", target: self, action: #selector(updateNow)); update.frame = NSRect(x: 78, y: 38, width: 150, height: 34)
         let close = NSButton(title: english ? "Close" : "关闭", target: self, action: #selector(closeWelcome)); close.frame = NSRect(x: 292, y: 38, width: 150, height: 34)
