@@ -166,12 +166,12 @@ struct BuiltInProvider: WallpaperProvider {
     func fetch() async throws -> WallpaperImage {
         let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
         let index = (day - 1) % count
-        let file = try renderIfNeeded(index: index)
+        let file = try fileURL(index: index)
         let title = language == .english ? "Built-in wallpaper #\(index + 1)" : "内置壁纸 #\(index + 1)"
         return WallpaperImage(id: "builtin-\(index + 1)", url: file, title: title, source: source)
     }
 
-    private func renderIfNeeded(index: Int) throws -> URL {
+    func fileURL(index: Int) throws -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let directory = base.appendingPathComponent("Wallpaper/BuiltIn", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -261,6 +261,12 @@ final class WallpaperManager {
 
     private func setDesktop(url: URL) throws {
         for screen in NSScreen.screens { try NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [:]) }
+    }
+
+    func apply(localURL: URL, title: String = "内置壁纸") throws {
+        try setDesktop(url: localURL)
+        lastImage = WallpaperImage(id: localURL.lastPathComponent, url: localURL, title: title, source: .builtin)
+        lastError = nil
     }
 
     private func pruneCache(keeping limit: Int) {
@@ -361,8 +367,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator()); menu.addItem(withTitle: english ? "Update now" : "立即更新", action: #selector(updateNow), keyEquivalent: "u")
         let pause = menu.addItem(withTitle: store.settings.pauseUpdates ? (english ? "Resume updates" : "恢复自动更新") : (english ? "Pause updates" : "暂停自动更新"), action: #selector(togglePause), keyEquivalent: "p"); pause.target = self
         let source = NSMenuItem(title: (english ? "Source: " : "壁纸来源：") + store.settings.source.title(for: store.settings.language), action: nil, keyEquivalent: ""); let sourceMenu = NSMenu(); WallpaperSource.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectSource(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; sourceMenu.addItem(child) }; source.submenu = sourceMenu; menu.addItem(source)
-        let strategy = NSMenuItem(title: (english ? "Strategy: " : "更新策略：") + store.settings.strategy.title(for: store.settings.language), action: nil, keyEquivalent: ""); let strategyMenu = NSMenu(); UpdateStrategy.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectStrategy(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; strategyMenu.addItem(child) }; strategy.submenu = strategyMenu; menu.addItem(strategy)
-        let cadence = NSMenuItem(title: english ? "Interval: \(store.settings.intervalMinutes) min" : "间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: english ? "Every \(minutes) minutes" : "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
+        let strategy = NSMenuItem(title: (english ? "Change timing: " : "更换时机：") + store.settings.strategy.title(for: store.settings.language), action: nil, keyEquivalent: ""); let strategyMenu = NSMenu(); UpdateStrategy.allCases.forEach { item in let child = NSMenuItem(title: item.title(for: store.settings.language), action: #selector(selectStrategy(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; strategyMenu.addItem(child) }; strategy.submenu = strategyMenu; menu.addItem(strategy)
+        let cadence = NSMenuItem(title: english ? "Change interval: \(store.settings.intervalMinutes) min" : "更换间隔：\(store.settings.intervalMinutes) 分钟", action: nil, keyEquivalent: ""); let cadenceMenu = NSMenu(); [15, 30, 60, 180].forEach { minutes in let child = NSMenuItem(title: english ? "Every \(minutes) minutes" : "每 \(minutes) 分钟", action: #selector(selectInterval(_:)), keyEquivalent: ""); child.representedObject = minutes; child.target = self; cadenceMenu.addItem(child) }; cadence.submenu = cadenceMenu; menu.addItem(cadence)
         let language = NSMenuItem(title: english ? "Language: English" : "语言：中文", action: nil, keyEquivalent: ""); let languageMenu = NSMenu(); AppLanguage.allCases.forEach { value in let child = NSMenuItem(title: value == .english ? "English" : "中文", action: #selector(selectLanguage(_:)), keyEquivalent: ""); child.representedObject = value.rawValue; child.target = self; languageMenu.addItem(child) }; language.submenu = languageMenu; menu.addItem(language)
         menu.addItem(withTitle: english ? "Open control panel" : "打开控制面板", action: #selector(openWelcome), keyEquivalent: "").target = self
         menu.addItem(.separator()); let folder = menu.addItem(withTitle: english ? "Open cache folder" : "打开缓存目录", action: #selector(openCache), keyEquivalent: ""); folder.target = self
@@ -382,23 +388,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showError() { NSSound.beep() }
 
     private func showWelcome() {
+        if let existing = welcomeWindow, existing.isVisible { existing.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         let english = store.settings.language == .english
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 210), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 520), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Wallpaper"
         window.isReleasedWhenClosed = false
-        let label = NSTextField(labelWithString: english ? "Wallpaper is running in the menu bar.\nIt will update your desktop automatically." : "Wallpaper 已在菜单栏运行。\n它会自动更新你的桌面壁纸。")
-        label.frame = NSRect(x: 32, y: 105, width: 356, height: 54)
+        let label = NSTextField(labelWithString: english ? "Choose a wallpaper" : "选择壁纸")
+        label.frame = NSRect(x: 32, y: 455, width: 456, height: 28)
         label.alignment = .center
-        label.font = .systemFont(ofSize: 15, weight: .medium)
-        label.maximumNumberOfLines = 2
-        let update = NSButton(title: english ? "Update now" : "立即更新", target: self, action: #selector(updateNow))
-        update.frame = NSRect(x: 90, y: 42, width: 110, height: 34)
-        let close = NSButton(title: english ? "Close" : "关闭", target: self, action: #selector(closeWelcome))
-        close.frame = NSRect(x: 220, y: 42, width: 110, height: 34)
-        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 210))
-        window.contentView?.addSubview(label); window.contentView?.addSubview(update); window.contentView?.addSubview(close)
+        label.font = .systemFont(ofSize: 20, weight: .semibold)
+        let hint = NSTextField(labelWithString: english ? "Low-resolution previews · click one to change your desktop" : "低清缩略图 · 点击即可更换当前桌面")
+        hint.frame = NSRect(x: 32, y: 428, width: 456, height: 20); hint.alignment = .center; hint.textColor = .secondaryLabelColor; hint.font = .systemFont(ofSize: 12)
+        let grid = NSView(frame: NSRect(x: 30, y: 92, width: 460, height: 320))
+        let provider = BuiltInProvider(language: store.settings.language)
+        let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
+        for offset in 0..<9 {
+            let row = offset / 3, column = offset % 3
+            let button = NSButton(frame: NSRect(x: CGFloat(column) * 150, y: CGFloat(2 - row) * 104, width: 140, height: 94))
+            button.bezelStyle = .texturedRounded; button.imageScaling = .scaleProportionallyUpOrDown; button.imagePosition = .imageOnly; button.target = self; button.action = #selector(selectPreview(_:))
+            let index = (day - 1 + offset) % 120
+            button.tag = index
+            if let url = try? provider.fileURL(index: index) { button.image = thumbnail(for: url) }
+            grid.addSubview(button)
+        }
+        let update = NSButton(title: english ? "Fetch latest" : "获取最新壁纸", target: self, action: #selector(updateNow)); update.frame = NSRect(x: 78, y: 38, width: 150, height: 34)
+        let close = NSButton(title: english ? "Close" : "关闭", target: self, action: #selector(closeWelcome)); close.frame = NSRect(x: 292, y: 38, width: 150, height: 34)
+        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 520))
+        window.contentView?.addSubview(label); window.contentView?.addSubview(hint); window.contentView?.addSubview(grid); window.contentView?.addSubview(update); window.contentView?.addSubview(close)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         welcomeWindow = window
+    }
+    private func thumbnail(for url: URL) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 220, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: 140, height: 86))
+    }
+    @objc private func selectPreview(_ sender: NSButton) {
+        do {
+            let url = try BuiltInProvider(language: store.settings.language).fileURL(index: sender.tag)
+            try manager.apply(localURL: url, title: store.settings.language == .english ? "Built-in wallpaper" : "内置壁纸")
+            rebuildMenu()
+        } catch { showError() }
     }
     @objc private func closeWelcome() { welcomeWindow?.orderOut(nil); UserDefaults.standard.set(true, forKey: "Wallpaper.HasShownWelcome") }
 }
