@@ -283,18 +283,6 @@ final class WallpaperManager {
         lastError = nil
     }
 
-    func cachePreview(_ image: WallpaperImage) async throws -> URL {
-        let previewDirectory = cacheDirectory.appendingPathComponent("Preview", isDirectory: true)
-        try fileManager.createDirectory(at: previewDirectory, withIntermediateDirectories: true)
-        let safeID = image.id.replacingOccurrences(of: "/", with: "-")
-        let destination = previewDirectory.appendingPathComponent("\(image.source.rawValue)-\(safeID).jpg")
-        if fileManager.fileExists(atPath: destination.path) { return destination }
-        let (temporaryURL, response) = try await URLSession.shared.download(from: image.url)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ProviderError.badResponse }
-        try fileManager.moveItem(at: temporaryURL, to: destination)
-        return destination
-    }
-
     private func pruneCache(keeping limit: Int) {
         guard let files = try? fileManager.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: [.contentModificationDateKey], options: .skipsHiddenFiles), files.count > limit else { return }
         let sorted = files.sorted { (a, b) -> Bool in
@@ -445,10 +433,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         welcomeWindow = window
         Task { await loadOnlinePreviews() }
-    }
-    private func thumbnail(for url: URL) -> NSImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 220, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { return nil }
-        return NSImage(cgImage: image, size: NSSize(width: 140, height: 86))
     }
     private func loadOnlinePreviews() async {
         let candidates = await WallpaperSourceCatalog.candidates(preferred: store.settings.source, language: store.settings.language, limit: 9)

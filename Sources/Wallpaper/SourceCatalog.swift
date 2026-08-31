@@ -34,8 +34,8 @@ extension WallpaperSource {
                 refreshDescriptionEnglish: "Selects and de-duplicates from featured candidates")
         case .wikimedia:
             return WallpaperSourceDescriptor(source: self, isOnline: true,
-                refreshDescriptionChinese: "自动获取精选公共领域图片",
-                refreshDescriptionEnglish: "Fetches featured public-domain images automatically")
+                refreshDescriptionChinese: "自动获取精选公共许可图片",
+                refreshDescriptionEnglish: "Fetches featured openly licensed images automatically")
         case .picsum:
             return WallpaperSourceDescriptor(source: self, isOnline: true,
                 refreshDescriptionChinese: "按日期生成稳定的随机图片",
