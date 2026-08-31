@@ -89,20 +89,26 @@ enum ProviderError: LocalizedError { case badResponse, emptyFeed, noData
 struct BingProvider: WallpaperProvider {
     let source: WallpaperSource = .bing
     func fetch() async throws -> WallpaperImage {
+        let items = try await fetchMany(limit: 1)
+        guard let first = items.first else { throw ProviderError.emptyFeed }
+        return first
+    }
+
+    func fetchMany(limit: Int) async throws -> [WallpaperImage] {
         var components = URLComponents(string: "https://www.bing.com/HPImageArchive.aspx")!
-        components.queryItems = [URLQueryItem(name: "format", value: "js"), URLQueryItem(name: "idx", value: "0"), URLQueryItem(name: "n", value: "1"), URLQueryItem(name: "mkt", value: "zh-CN")]
+        components.queryItems = [URLQueryItem(name: "format", value: "js"), URLQueryItem(name: "idx", value: "0"), URLQueryItem(name: "n", value: "\(max(1, min(limit, 8)))"), URLQueryItem(name: "mkt", value: "zh-CN")]
         let (data, response) = try await URLSession.shared.data(from: components.url!)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ProviderError.badResponse }
         struct Feed: Decodable { struct Item: Decodable { let url: String; let hsh: String?; let copyright: String? }; let images: [Item] }
         let feed = try JSONDecoder().decode(Feed.self, from: data)
-        guard let item = feed.images.first else { throw ProviderError.emptyFeed }
-        let imageURL: URL
-        if let absolute = URL(string: item.url), absolute.scheme != nil {
-            imageURL = absolute
-        } else {
-            imageURL = URL(string: "https://www.bing.com" + (item.url.hasPrefix("/") ? item.url : "/" + item.url))!
+        let images = feed.images.map { item -> WallpaperImage in
+            let imageURL: URL
+            if let absolute = URL(string: item.url), absolute.scheme != nil { imageURL = absolute }
+            else { imageURL = URL(string: "https://www.bing.com" + (item.url.hasPrefix("/") ? item.url : "/" + item.url))! }
+            return WallpaperImage(id: item.hsh ?? imageURL.absoluteString, url: imageURL, title: item.copyright ?? "Bing 每日壁纸", source: source)
         }
-        return WallpaperImage(id: item.hsh ?? imageURL.absoluteString, url: imageURL, title: item.copyright ?? "Bing 每日壁纸", source: source)
+        guard !images.isEmpty else { throw ProviderError.emptyFeed }
+        return images
     }
 }
 
@@ -264,10 +270,22 @@ final class WallpaperManager {
         for screen in NSScreen.screens { try NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [:]) }
     }
 
-    func apply(localURL: URL, title: String = "内置壁纸") throws {
+    func apply(localURL: URL, title: String = "内置壁纸", source: WallpaperSource = .builtin) throws {
         try setDesktop(url: localURL)
-        lastImage = WallpaperImage(id: localURL.lastPathComponent, url: localURL, title: title, source: .builtin)
+        lastImage = WallpaperImage(id: localURL.lastPathComponent, url: localURL, title: title, source: source)
         lastError = nil
+    }
+
+    func cachePreview(_ image: WallpaperImage) async throws -> URL {
+        let previewDirectory = cacheDirectory.appendingPathComponent("Preview", isDirectory: true)
+        try fileManager.createDirectory(at: previewDirectory, withIntermediateDirectories: true)
+        let safeID = image.id.replacingOccurrences(of: "/", with: "-")
+        let destination = previewDirectory.appendingPathComponent("\(image.source.rawValue)-\(safeID).jpg")
+        if fileManager.fileExists(atPath: destination.path) { return destination }
+        let (temporaryURL, response) = try await URLSession.shared.download(from: image.url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ProviderError.badResponse }
+        try fileManager.moveItem(at: temporaryURL, to: destination)
+        return destination
     }
 
     private func pruneCache(keeping limit: Int) {
@@ -356,6 +374,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var scheduler: Scheduler!
     private var welcomeWindow: NSWindow?
+    private var previewURLs: [URL] = []
+    private var previewTitles: [String] = []
+    private var previewSources: [WallpaperSource] = []
+    private var previewButtons: [NSButton] = []
     private lazy var manager = WallpaperManager(settingsStore: store)
     private let statusTitle = "正在准备…"
 
@@ -436,6 +458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let grid = NSView(frame: NSRect(x: 30, y: 92, width: 460, height: 320))
         let provider = BuiltInProvider(language: store.settings.language)
         let day = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 1
+        previewURLs = []; previewTitles = []; previewSources = []; previewButtons = []
         for offset in 0..<9 {
             let row = offset / 3, column = offset % 3
             let cell = NSView(frame: NSRect(x: CGFloat(column) * 150, y: CGFloat(2 - row) * 104, width: 140, height: 94))
@@ -446,7 +469,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cell.addSubview(imageView)
             let button = NSButton(frame: cell.bounds)
             button.isBordered = false; button.title = ""; button.target = self; button.action = #selector(selectPreview(_:)); button.autoresizingMask = [.width, .height]
-            button.tag = index
+            button.tag = offset
+            if let url = try? provider.fileURL(index: index) { previewURLs.append(url) } else { previewURLs.append(URL(fileURLWithPath: "/")) }
+            previewTitles.append(english ? "Built-in wallpaper #\(index + 1)" : "内置壁纸 #\(index + 1)"); previewSources.append(.builtin); previewButtons.append(button)
             cell.addSubview(button); grid.addSubview(cell)
         }
         let update = NSButton(title: english ? "Fetch latest" : "获取最新壁纸", target: self, action: #selector(updateNow)); update.frame = NSRect(x: 78, y: 38, width: 150, height: 34)
@@ -455,15 +480,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView?.addSubview(label); window.contentView?.addSubview(hint); window.contentView?.addSubview(grid); window.contentView?.addSubview(update); window.contentView?.addSubview(close)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         welcomeWindow = window
+        Task { await loadOnlinePreviews() }
     }
     private func thumbnail(for url: URL) -> NSImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 220, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { return nil }
         return NSImage(cgImage: image, size: NSSize(width: 140, height: 86))
     }
+    private func loadOnlinePreviews() async {
+        var candidates: [WallpaperImage] = []
+        if let bing = try? await BingProvider().fetchMany(limit: 8) { candidates.append(contentsOf: bing) }
+        if candidates.count < 9, let unsplash = try? await UnsplashProvider().fetch() { candidates.append(unsplash) }
+        for (index, candidate) in candidates.prefix(9).enumerated() {
+            guard let localURL = try? await manager.cachePreview(candidate), let image = thumbnail(for: localURL) else { continue }
+            await MainActor.run { [weak self] in
+                guard let self, index < self.previewButtons.count else { return }
+                self.previewURLs[index] = localURL; self.previewTitles[index] = candidate.title; self.previewSources[index] = candidate.source
+                self.previewButtons[index].image = image; self.previewButtons[index].toolTip = candidate.title
+            }
+        }
+    }
     @objc private func selectPreview(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < previewURLs.count else { return }
         do {
-            let url = try BuiltInProvider(language: store.settings.language).fileURL(index: sender.tag)
-            try manager.apply(localURL: url, title: store.settings.language == .english ? "Built-in wallpaper" : "内置壁纸")
+            let url = previewURLs[sender.tag]
+            try manager.apply(localURL: url, title: previewTitles[sender.tag], source: previewSources[sender.tag])
             rebuildMenu()
         } catch { showError() }
     }

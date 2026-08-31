@@ -33,7 +33,7 @@
 
 ## 图标
 
-应用图标位于 `Assets/AppIcon.png`，由日出、山脉和湖泊构成的圆角玻璃图标。打包脚本会自动把它复制到 App Bundle 的 Resources 并写入 `Info.plist`。
+应用图标源图位于 `Assets/AppIcon.png`，发布使用的 macOS 图标文件为 `Assets/AppIcon.icns`；图标由日出、山脉和湖泊构成。打包脚本会自动把它们复制到 App Bundle 的 Resources，并通过 `Info.plist` 使用 `.icns` 图标。
 
 ## 构建与运行
 
