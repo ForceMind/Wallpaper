@@ -2,7 +2,10 @@ import AppKit
 import Foundation
 import ImageIO
 import Network
+import OSLog
 import UniformTypeIdentifiers
+
+private let wallpaperLogger = Logger(subsystem: "local.wallpaper.app", category: "Wallpaper")
 
 // MARK: - Domain
 
@@ -230,13 +233,15 @@ final class WallpaperManager {
         var seen = Set<WallpaperSource>()
         for provider in providers where seen.insert(provider.source).inserted {
             do {
+                wallpaperLogger.info("Starting wallpaper fetch from \(provider.source.rawValue, privacy: .public)")
                 let image = try await provider.fetch()
                 let localURL = try await download(image)
-                try setDesktop(url: localURL)
+                try await MainActor.run { try setDesktop(url: localURL) }
                 lastImage = image; lastError = nil
+                wallpaperLogger.info("Wallpaper changed successfully from \(image.source.rawValue, privacy: .public)")
                 pruneCache(keeping: settingsStore.settings.keepFiles)
                 return .success(image)
-            } catch { lastError = error.localizedDescription }
+            } catch { lastError = error.localizedDescription; wallpaperLogger.error("Wallpaper source failed: \(error.localizedDescription, privacy: .public)") }
         }
         return .failure(ProviderError.noData)
     }
@@ -278,7 +283,7 @@ final class WallpaperManager {
 
     func apply(image: WallpaperImage) async throws {
         let localURL = image.url.isFileURL ? image.url : try await download(image)
-        try setDesktop(url: localURL)
+        try await MainActor.run { try setDesktop(url: localURL) }
         lastImage = image
         lastError = nil
     }
@@ -323,6 +328,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusTitle = "正在准备…"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        ProcessInfo.processInfo.disableAutomaticTermination("Wallpaper scheduler must remain active")
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let image = NSImage(systemSymbolName: "photo.on.rectangle", accessibilityDescription: "Wallpaper") {
@@ -338,6 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func performUpdate(manual: Bool = false) async {
         guard manual || !store.settings.pauseUpdates else { return }
+        wallpaperLogger.info("Wallpaper change requested (manual: \(manual, privacy: .public))")
         await MainActor.run { [weak self] in self?.panelStatusLabel?.stringValue = self?.store.settings.language == .english ? "Fetching from preferred source…" : "正在从首选来源获取…" }
         let result = await manager.update()
         await MainActor.run { [weak self] in
