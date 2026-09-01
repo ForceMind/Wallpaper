@@ -326,6 +326,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var panelStatusLabel: NSTextField?
     private lazy var manager = WallpaperManager(settingsStore: store)
     private let statusTitle = "正在准备…"
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev" }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         ProcessInfo.processInfo.disableAutomaticTermination("Wallpaper scheduler must remain active")
@@ -336,7 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.image = image
         }
         statusItem.button?.title = store.settings.language == .english ? " Wallpaper" : " 壁纸"
-        statusItem.button?.toolTip = store.settings.language == .english ? "Wallpaper" : "壁纸"
+        statusItem.button?.toolTip = store.settings.language == .english ? "Wallpaper v\(appVersion)" : "壁纸 v\(appVersion)"
         scheduler = ChangeScheduler(settingsProvider: { [weak self] in self?.store.settings ?? AppSettings() }, changeHandler: { [weak self] _ in Task { await self?.performUpdate() } })
         scheduler.start(); rebuildMenu()
         if !UserDefaults.standard.bool(forKey: "Wallpaper.HasShownWelcome") { showWelcome() }
@@ -359,7 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         let english = store.settings.language == .english
         let menu = NSMenu(); let state = manager.lastImage?.title ?? (english ? "Preparing…" : statusTitle)
-        menu.addItem(withTitle: state, action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "Wallpaper v\(appVersion) · \(state)", action: nil, keyEquivalent: "")
         menu.addItem(.separator()); menu.addItem(withTitle: english ? "Update now" : "立即更新", action: #selector(updateNow), keyEquivalent: "u")
         let pause = menu.addItem(withTitle: store.settings.pauseUpdates ? (english ? "Resume updates" : "恢复自动更新") : (english ? "Pause updates" : "暂停自动更新"), action: #selector(togglePause), keyEquivalent: "p"); pause.target = self
         let source = NSMenuItem(title: (english ? "Preferred source: " : "首选来源：") + store.settings.source.title(for: store.settings.language), action: nil, keyEquivalent: ""); let sourceMenu = NSMenu(); WallpaperSource.allCases.forEach { item in let child = NSMenuItem(title: item.selectionDescription(for: store.settings.language), action: #selector(selectSource(_:)), keyEquivalent: ""); child.representedObject = item.rawValue; child.target = self; sourceMenu.addItem(child) }; source.submenu = sourceMenu; menu.addItem(source)
@@ -403,9 +404,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let existing = welcomeWindow, existing.isVisible { existing.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         let english = store.settings.language == .english
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 600), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "Wallpaper"
+        window.title = "Wallpaper v\(appVersion)"
         window.isReleasedWhenClosed = false
-        let label = NSTextField(labelWithString: english ? "Choose a wallpaper" : "选择壁纸")
+        let label = NSTextField(labelWithString: english ? "Choose a wallpaper · v\(appVersion)" : "选择壁纸 · v\(appVersion)")
         label.frame = NSRect(x: 32, y: 535, width: 456, height: 28)
         label.alignment = .center
         label.font = .systemFont(ofSize: 20, weight: .semibold)
